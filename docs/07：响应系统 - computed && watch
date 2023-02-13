@@ -1,0 +1,584 @@
+# 第七章：响应系统 - computed && watch
+
+### 01：开篇
+
+对于响应性系统而言，除了我们在前两张接触的 `ref` 和 `reactive` 之外，还有另外两个也是我们经常使用到的，那就是：
+
+1. 计算属性：`computed`
+2. 侦听器：`watch`
+
+那么本章节，我们就来看一下，这两个 `API` 是如何进行实现的。
+
+在看本章节的内容之前，大家需要：**搞明白 `vue3` 中 `computed` 和 `watch` 的基本作用和基本用法。**
+
+搞明白了这两个 `API` 的基本用法之后，在来学习本章。
+
+### 02：源码阅读：computed 的响应性，跟踪 `Vue3` 源码实现逻辑
+
+> 计算属性 `computed`会 **基于其响应式依赖被缓存**，并且在依赖的响应式数据发生变化时 **重新计算**
+
+那么根据计算属性的概念，我们可以创建对应的测试实例：
+
+`packages/vue/examples/imooc/computed.html`
+
+```html
+ <script>
+    const { reactive, effect, computed } = Vue
+
+    const obj = reactive({
+      name: '张三'
+    })
+
+    const computeObj = computed(() => {
+      return '姓名: ' + obj.name
+    })
+
+    effect(() => {
+      document.querySelector('#app').innerText = computeObj.value
+    })
+
+    setTimeout(() => {
+      obj.name = '李四'
+    }, 2000)
+  </script>
+```
+
+在以上测试实例中，程序主要执行了 5 个步骤：
+
+1. 使用 `reactive` 创建响应性数据
+2. 通过 `computed` 创建计算属性 `computedObj`，并且触发了 `obj` 的 `getter`
+3. 通过 `effect` 方法创建 `fn` 函数
+4. 在 `fn` 函数中，触发了 `computed` 的 `getter`
+5. 延迟触发了 `obj` 的 `setter`
+
+那么在这 5 个步骤中，有些步骤进行的操作我们是了解的，所以我们只需要看之前没有了解过得即可。
+
+#### computed
+
+`computed` 的代码在 `packages/reactivity/src/computed.ts` 中，我们可以在这里为 `computed`函数增加断点：
+
+1. 进入 `computed` 函数
+
+2. 执行 `const onlyGetter = isFunction(getterOrOptions)` 方法：
+
+   1. `getterOrOptions` 为传入的第一个参数，因为我们传入的为函数，所以 `onlyGetter = true`
+
+3. 执行 `getter = getterOrOptions`，即：`getter` 为我们传入的函数
+
+4. 执行：`setter = NOOP`，`NOOP` 为 `() => {}`
+
+5. 执行：`new ComputedRefImpl`，**创建 `ComputedRefImpl` 实例**，那么这里的 `ComputedRefImpl` 是什么呢？
+
+6. 进入 `ComputedRefImpl`
+
+   1. 在构造函数中，可以看到：**创建了 `ReactiveEffect` 实例，**并且传入了两个参数：
+
+      1. `getter`：触发 `computed` 函数时，传入的第一个参数
+
+      2. 匿名函数：当 `this._dirty` 为 `false` 时，会触发 `triggerRefValue`，我们知道 `triggerRefValue` 会 **依次触发依赖**
+
+         ```typescript
+         () => {
+           // _dirty 表示“脏”的意思，这里理解为 《依赖的响应性数据发生变化，计算属性需要重新计算了》
+           if(!this._dirty) {
+             this._dirty = true
+             triggerRefValue(this)
+           }
+         }
+         ```
+
+   2. 而对于 `ReactiveEffect` 而言，我们之前也是有了解过的：
+
+      1. 它位于 `packages/reactivity/src/effect.ts` 文件中
+      2. 提供了一个 `run` 方法 和 一个 `stop` 方法：
+         1. `run` 方法：触发 `fn`，即传入的第一个参数
+         2. `stop` 方法：语义上为停止的意思，目前还没有实现
+      3. 生成的实例，我们一般把它叫做 `effect`
+
+   3. 执行 **this.effect.computed = this** ，即：`effect` **实例**被挂载了一个新的属性 `computed` 为当前的 `ComputedRefImpl` 的实例。
+
+   4. `ReactiveEffect` **构造函数执行完成**
+
+7. 在 `computed` 中返回了 `ComputedRefImpl` 实例
+
+由以上代码可知，但我们执行 `computed`函数时：
+
+1. 定义变量 `getter` 为我们传入的回调函数
+2. 生成了 `ComputedRefImpl` 实例，作为 `computed` 函数的返回值
+3. `ComputedRefImpl` 内部，利用了 `ReactiveEffect` 函数，并且传入了 **第二个参数**
+
+#### Computed 的 getter
+
+当 `computed` 代码执行完成之后，我们在 `effect` 中触发了 `computed` 的 `getter`:
+
+```typescript
+computedObj.value
+```
+
+根据我们之前在学习 `ref` 的时候可知，`.value` 属性的调用本质上是一个 `get value` **的函数调用，**而 `computedObj` 作为 `computed` 的返回值，本质上是 `ComputedRefImpl` 的实例，所以此时会触发 `ComputedRefImpl` 下的 `get value` 函数。
+
+1. 进入 `ComputedRefImpl` 下的 `get value` 函数
+
+2. 执行 `trackRefValue(self)` ，该方法我们是有过了解的，知道它的作用是：**收集依赖**，它接收一个 `ref` 作为参数，该 `ref` 本质上就是 `ComputedRefImpl` 是实例：
+
+   ![image-20230213235740993](img/image-20230213235740993.png)
+
+3. 执行 `self._dirty = false`，我们知道 如果`_dirty = true`则会 **触发执行依赖。**在 **当前（标记为 false 之前）**，`self_.dirty = true`
+
+4. 所以接下来执行 `self.effect.run()`!，执行了 `run` 方法，我们知道 `run` 方法内部其实会触发 `fn` 函数，即：`computed` **接收的第一个参数**
+
+5. 接下来把 `self._value = self.effect.run()`!，此时， `self._value` 的值为 `compted`第一个参数（`fn` 函数）的返回值，即为：**计算属性计算之后的值**
+
+6. 最后执行 `return self._value`，返回计算的值
+
+由以上的代码可知：
+
+1.  `ComputedRefImpl` 实例本身就没有 **代理监听**，它本质上是一个 `get value` 和 `set value` 的触发
+2. 在每一次 `get value` 被触发时，都会主动触发一次 **依赖收集**
+3. 根据 `_dirty` 和 `_cacheable`的状态判断，是否需要触发 `run` 函数
+4. `computed` 的返回值，其实是 `run` 函数执行之后的返回值
+
+#### ReactiveEffect 的 scheduler
+
+到现在为止，我们貌似已经分析完成了 `computed`的源码执行逻辑，但是大家仔细来看上面的逻辑分析，可以发现，目前这样的逻辑还存在一些问题。
+
+我们知道对于计算属性而言，当它依赖的响应式数据发生变化时，它将重新计算。那么换句话而言就是：**当响应性数据触发 `setter` 时，计算属性需要触发依赖**
+
+在上面的代码中，我们知道，当《每一次 `get value` 被触发时，都会主动触发一次 **依赖收集**》，但是 **触发依赖** 的地方在哪里呢？
+
+根据以上代码可知：在 `ComputedRefImpl` 的构造函数中，我们创建了 `ReactiveEffect`实例，并且传递了第二个参数，该参数为一个回调函数，在这个回调函数中：我们会根据 **脏** 的状态来执行 `triggerRefValue`，即 **触发依赖**，重新计算。
+
+那么这个 `ReactiveEffect`**第二个参数** 是什么呢？它会在什么时候被触发，以 **触发依赖** 呢？
+
+我们来看一下：
+
+1. 进入 `packages/reactivity/src/effect.ts` 中
+
+2. 查看 `ReactiveEffect` 的构造函数，可以第二个参数为 `scheduler`
+
+3. `scheduler` 表示 **调度器** 的意思，我们查看 `packages/reactivity/src/effect.ts` 中 `triggerEffect` 方法，可以发现这里进行了调度器的判定：
+
+   ```typescript
+   function triggerEffect(...) {
+     ...
+     	if (effect.scheduler) {
+         effect.scheduler()
+       }
+     ...
+   }
+   ```
+
+4. 那么接下来我们就可以跟踪一下代码的实现。
+
+#### 跟踪代码
+
+我们知道 **延迟两秒之后**，会触发 `obj.name` 即 `reactive` 的 `setter` 行为，所以我们可以在 `packages/reactivity/src/baseHandlers.ts` 中为 `set` 增加一个断点：
+
+1. 进入 `reactive` 的 `setter` （注意：这里是延迟两秒之后 `setter` 行为）
+
+2. 跳过之前的相同逻辑之后，可知，最后会触发：`trigger(target, TriggerOpTypes.SET, key, value, oldValue)` 方法
+
+3. 进入 `trigger` 方法：
+
+4. 同样跳过之前相同逻辑，可知，最后会触发：`triggerEffects(deps[0], eventInfo)` 方法
+
+5. 进入 `triggerEffects` 方法：
+
+6. **这里要注意：**因为我们在 `ComputedRefImpl` 的构造函数中，执行了 `this.effect.computed = this` ，**所以此时的 `if(effect.computed)` 判断将会为 `true`**：
+
+   1. 此时我们注意看 `effects`，此时 `effect` 的值为 `ReactiveEffect`的实例，同时 `scheduler` 存在值：
+
+      ![image-20230214001729966](img/image-20230214001729966.png)
+
+   2. 接下来进入 `triggerEffect`：
+
+      1. 在 `triggerEffect` 中
+
+      2. 执行 `if(effect.scheduler)` 判断，因为 `effect` 存在 `scheduler`，所以会 **执行 `scheduler` 函数**
+
+      3. 此时会进入 `ComputedRefImpl` **类的构造函数中，传递的回调函数**
+
+         1. 进入 `scheduler` **回调**
+
+         2. 此时 `this` 的状态如下：
+
+            ![image-20230214002019488](img/image-20230214002019488.png)
+
+         3. 所以会执行 `triggerRefValue` 函数：
+
+            1. 进入 `triggerRefValue` 函数
+
+            2. 会再次触发 `triggerEffects` 函数，把当前的 `this.dep` 作为参数传入
+
+               1. 再次进入 `triggerEffects`
+
+               2. **注意：**此时的 `effects` 的值为：
+
+                  ![image-20230214002145101](img/image-20230214002145101.png)
+
+               3. 这次的 `ReactiveEffect` **不再包含** 调度器
+
+               4. 接下来进入 `triggerEffect`：
+
+                  1. 在 `triggerEffect` 因为 `effect` 不在包含调度器 `scheduler`
+
+                  2. 所以会直接执行 `fn` 函数
+
+                  3. `fn` 函数的触发，标记着 `computedObj.value` 触发，而我们知道 `computedObj.value`本质上是 `get value` 函数的触发，所以代码接下来会触发 `ComputedRefImpl` 的 `get value`
+
+                  4. 接下来进入 `get value`
+
+                     1. 进入 `get value`
+
+                     2. 执行 `self._value = self.effect.run()!`，而 `run` 函数的执行本质上是 `fn` 函数的执行，而此时 `fn` 函数为：
+
+                        ![image-20230214002524005](img/image-20230214002524005.png)
+
+                     3. 执行该函数得到计算的值
+
+                     4. 最后作为 `computedObj.value` 的返回值
+
+                     5. 省略后续的触发......
+
+至此，整个 `obj.name` 引发的副作用全部执行完成。
+
+由以上代码可知，整个的计算属性的逻辑是非常复杂的，我们来做一下整理：
+
+1. 整个事件由 `obj.name` 开始
+
+2. 触发 `proxy` 实例的 `setter`
+
+3. 执行 `trigger` ，**第一次触发依赖**
+
+4. 注意，此时 `effect` 包含调度器属性，所以会触发调度器
+
+5. 调度器指向 `ComputedRefImpl` 的构造函数中传入的匿名函数
+
+6. 在匿名函数中会：**再次触发依赖**
+
+7. 即：**两次触发依赖**
+
+8. 最后执行：
+
+   ```js
+   () => {
+   	return '姓名：' + obj.name
+   }
+   ```
+
+#### 总结
+
+那么到这里我们基本上了解了 `computed` 的执行逻辑，里面涉及到了一些我们之前没有了解过的概念，比如 **调度器 `scheduler` ，**并且整体的 `computed` 的流程也相当复杂。
+
+所以接下来我们去实现 `computed` 的时候，会分步骤一步一步执行。
+
+
+
+### 03：框架实现：构建 `ComputedRefImpl`，读取计算属性的值
+
+对于 `computed` 而言，整体比较复杂，所以我们将会分步进行实现。
+
+那么对于本小节而言，我们的首先的目标是：**构建 `ComputedRefImpl 类，创建出 `computed` 方法，并且能够读取值**
+
+1. 创建 `packages/reactivity/src/computed.ts`：
+
+   ```typescript
+   
+   ```
+
+   
+
+2. 的
+
+### 04：框架实现：`computed`的响应性：初见调度器，处理脏的状态
+
+根据之前的代码可知，如果我们想要实现 **响应性**，那么必须具备两个条件：
+
+1. 收集依赖：该操作我们目前已经在 `get value` 中进行。
+2. 触发依赖：该操作我们目前尚未完成，而这个也是我们本小节主要需要做的事情。
+
+那么根据第二小节的源码可知，这部分代码是写在 `ReactiveEffect` 第二个参数上的：
+
+```typescript
+() => {
+	if (!this._dirty) {
+    this._dirty = true
+    triggerRefValue(this)
+  }
+}
+```
+
+这个参数是一个匿名函数，被叫做 `scheduler` 调度器。
+
+该匿名函数中，又涉及到了一个 `_dirty` 变量，该变量我们把它叫做 **脏**。
+
+那么想要 `computed` 的响应性，那就必须要搞明白这两个东西的概念
+
+#### 调度器
+
+调度器 `scheduler`是一个相对比较复杂的概念，它在 **computed** 和 **watch** 中都有涉及，但是在当前的  `computed` 实现中，它的作用还算比较清晰。
+
+所以根据我们秉承的：**没有使用就当做不存在** 的理念，我们只需要搞明白，它在当前的作用即可。
+
+根据我们在第二小节的源码阅读，我们可以知道，此时的 `scheduler`就相当于一个 **回调函数。**
+
+在 `triggerEffect`只要 `effect`存在 `scheduler`，则就会执行该函数。
+
+#### `_dirty` 脏
+
+对于 `dirty` 而言，相对比较简单了。
+
+它只是一个变量，我们只需要知道：**它为 false 时，表示需要触发依赖。为 true 时表示需要重新执行run 方法获取数据** 即可
+
+
+
+### 05：框架实现：`computed` 的缓存性
+
+我们知道 `computed` 区别于 `function` 最大的地方就是：`computed` **具备缓存，**当多次触发计算时，那么计算属性只会计算 **一次。**
+
+那么秉承着这样的一个理念，我们来创建一个测试用例：
+
+1. 创建 `packages/vue/examples/reactivity/computed-cache.html`：
+
+   ```html
+   <script>
+       const { reactive, effect, computed } = Vue
+   
+       const obj = reactive({
+         name: '张三'
+       })
+   
+       const computeObj = computed(() => {
+         console.log('计算属性')
+   
+         return '姓名: ' + obj.name
+       })
+   
+       effect(() => {
+         document.querySelector('#app').innerText = computeObj.value
+         document.querySelector('#app').innerText = computeObj.value
+       })
+   
+       setTimeout(() => {
+         obj.name = '李四'
+       }, 2000)
+     </script>
+   ```
+
+   
+
+运行到浏览器，我们发现当前代码出现了 **死循环** 的问题。
+
+那么这个 **死循环** 是因为什么呢？
+
+如果我们想要实现计算属性的缓存性，又应该如何进行实现呢？
+
+带着这两个问题，我们继续来往下看
+
+#### 为什么会出现死循环
+
+我们为当前的代码进行 `debugger`，查看出现该问题的原因。我们知道这个死循环是在 **延迟两秒后** 出现的，而延迟两秒之后是 obj.name 的调用，即：`reactive`的 `getter`行为被触发，也就是 `trigger` 方法触发时：
+
+1. 为 `packages/reactivity/src/effect.ts` 中的 `trigger` 方法增加断点，延迟两秒之后，进入断点：
+
+2. 此时执行的代码是 `obj.name = '李四'`，所以 `target` 为 `{name: '李四'}`
+
+3. 但是要 **注意**，此时 `targetMap`中，已经 **收集过 `effect` 了**，此时的 `dep` 中包含一个 **计算属性** 的 `effect`：
+
+   ![image-20230214015203222](img/image-20230214015203222.png)
+
+4. 代码继续向下进行，进入 `triggerEffects(dep)` 方法
+
+5. 在 `triggerEffects(dep)` 方法中，继续进入 `triggerEffect(effect)`
+
+6. 在 `triggerEffect` 中接收到的 `effect`，即为刚才查看的 **计算属性** 的  `effect`：
+
+   ![image-20230214015345591](img/image-20230214015345591.png)
+
+7. 此时因为 `effect` 中存在 `scheduler`，所以会执行该属性的 `scheduler` 函数，在 `scheduler` 函数中，会触发 `triggerRefValue(this)`，而 `triggerRefValue` 则会再次触发 `triggerEffects`。
+
+8. **特别注意：**此时 `effects` 的值为 **计算属性实例的 `dep`：**
+
+   ![image-20230214015525221](img/image-20230214015525221.png)
+
+9. 循环 `effects`，从而再次进入 `triggerEffect` 中。
+
+10. **再次进入** `triggerEffect`，此时 `effect` 为 **非计算属性的** `effect`，即 `fn` 函数：
+
+    ![image-20230214015636054](img/image-20230214015636054.png)
+
+11. 因为它 **不是** 计算属性的 `effect`，所以会直接执行 `run` 方法。
+
+12. 而我们知道 `run` 方法中，其实就是触发了 `fn` 函数，所以最终会执行：
+
+    ![image-20230214015900519](img/image-20230214015900519.png)
+
+13. 但是在这个 `fn` 函数中，是有触发 `computedObj.value` 的，而 `computedObj.value` 其实是触发了 `computed` 的 `get value` 方法。
+
+14. 那么这次 `run` 的执行会触发 **两次 `computed` 的 `get value`**
+
+    1. 第一次进入：
+       1. 进入 `computed` 的 `get value`：
+       2. 首先收集依赖
+       3. 接下来检查 `dirty` 脏的状态，执行 `this.effect.run()!`
+       4. 获取最新值，返回
+    2. 第二次进入：
+       1. 进入 `computed` 的 `get value`：
+       2. 首先收集依赖
+       3. 接下来检查 `dirty` 脏的状态，**因为在上一次中 `dirty` 已经为 `false`，**所以本次 **不会在触发 `this.effect.run()!**
+       4. 直接返回结束
+
+15. **按说代码应该到这里就结束了，**但是不要忘记，在刚才我们进入到 `triggerEffects`时，`effects` 是一个数组，内部还存在一个 `computed` **的 `effect`**，所以代码会 **继续** 执行，再次来到 `triggerEffect` 中：
+
+    1. 此时 `effect` 为 `computed` 的 `effect`:
+
+       ![image-20230214020407069](img/image-20230214020407069.png)
+
+    2. 这会导致，再次触发 `scheduler`。
+
+    3. `scheduler` 中还会再次触发 `triggerRefValue`
+
+    4. `triggerRefValue` 又触发 `triggerEffects`，**再次生成一个新的 `effects` 包含两个 `effect` ，**就像 **第七步 一样**
+
+    5. 从而导致 **死循环**
+
+    以上逻辑就是为什么会出现死循环的原因。
+
+    那么明确好了导致死循环的代码逻辑之后，接下来就是如何解决这个死循环的问题了
+
+    > PS：这里要注意的一点：`vue-next-mini` 是一个学习 `vue3` 核心源码的库，所以它在一些复杂业务中会存在各种 `bug`。而这样的 `bug` 在 `vue3` 的源码中处理完善的逻辑非常非常复杂，我们不可能完全按照 `vue3` 的标准来去处理
+    >
+    > 所以我们秉承着 **最少代码的实现逻辑** 来解决对应的 `bug`，它 **并不是一个完善的方案**，但是可以保证 **它是 vue3 的源码逻辑，并且是合理的！**
+
+#### 如何解决死循环
+
+想要解决这个死循环的问题，其实比较简单，只需要在 `packages/reactivity/src/effect.ts`中的  `triggerEffects` 中修改如下代码：
+
+```typescript
+export function triggerEffects (dep: Dep) {
+  const effects = isArray(dep) ? dep : [...dep]
+
+  // 依次触发依赖
+  // for (const effect of effects) {
+  //   triggerEffect(effect)
+  // }
+
+  // 不再依次触发，而是先后触发所有的计算属性依赖，再触发所有的非计算属性依赖
+  for (const effect of effects) {
+    if (effect.computed) {
+      triggerEffect(effect)
+    }
+  }
+
+  for (const effect of effects) {
+    if (!effect.computed) {
+      triggerEffect(effect)
+    }
+  }
+}
+```
+
+那么为什么这样就可以解决死循环的 bug 呢？
+
+我们再次安照刚才的顺序跟踪下代码进行查看：
+
+1. 为 `packages/reactivity/src/effect.ts`中的 `trigger` 方法增加断点，延迟两秒之后，进入断点：
+
+2. 此时执行的代码是 `obj.name = '李四'`，所以在 `target` 为 `{name: '李四'}`
+
+3. **但是要注意**，此时 `targetMap` 中，已经在 **收集过 `effect` **了，此时的 `dep` 中包含一个 **计算属性：**
+
+   ![image-20230214021640074](img/image-20230214021640074.png)
+
+4. 代码继续向下进行，进入 `triggerEffects(dep)`方法
+
+5. 在 `triggerEffects(dep)` 方法中，继续进入 `triggerEffect(effect)`
+
+6. 在 `triggerEffect` 中接收到的 `effect`，即为刚才查看的 **计算属性的 `effect`:**
+
+   ![image-20230214022012404](img/image-20230214022012404.png)
+
+7. 此时因为 `effect` 中存在 `scheduler`，所以会执行计算属性的 `scheduler` 函数，在 `scheduler` 函数中，会触发 `triggerRefValue(this)`，而 `triggerRefValue`则会再次触发 `triggerEffects`
+
+8. **-----------不同从这里开始--------------**
+
+9. 因为此时我们在 `triggerEffects` 中，增加了 **判断逻辑**，所以 **永远会先触发** 计算属性的 `effect`。
+
+10. 所以此时再次进入到 `triggerEffect`时，此时的 `effect` 依然为 **计算属性的 `effect`:**
+
+    ![image-20230214022306527](img/image-20230214022306527.png)
+
+11. 从而因为存在 `scheduler`，所以会执行：
+
+    ![image-20230214022420165](img/image-20230214022420165.png)
+
+12. 但是此时要注意： **此时的 `_dirty` 脏的状态** 为 `true`，即：**不会触发 `triggerRefValue` 来触发依赖，**此时计算属性的 `scheduler` 调度器会 **直接结束**
+
+13. 然后代码 **调回到 `triggerEffects` 两次循环中**，使用 **非计算属性的 `effect`** 执行
+
+14. 本次进入 `triggerEffect` 时，`effect` 数据如下：
+
+    ![image-20230214022701628](img/image-20230214022701628.png)
+
+15. 那么这次 `run` 的执行触发 **两次 `computed` 的 `get value`**
+
+16. 所以代码会进入到 `computed` 的 `get value` 中：
+
+    1. 第一次进入：
+       1. 进入 `computed` 的 `get value`
+       2. 首先收集依赖
+       3. 接下来检查 `dirty` 脏的状态，执行 `this.effect.run()!`
+       4. 获取最新值，返回
+    2. 第二次进入：
+       1. 进入 `computed` 的 `get value:`
+       2. 首先收集依赖
+       3. 接下来检查 `dirty` 脏的状态，**因为在上一次中 `dirty` 已经为 `false` **，所以本次 **不会再触发 `this.effect.run()!`**
+       4. 直接返回结束
+
+所有代码逻辑结束。
+
+查看测试实例的打印，`computed`只计算了一次。
+
+#### 总结
+
+那么到这里就解决了计算属性的死循环问题和缓存的问题。
+
+其实解决的方式非常的简单，只需要控制 `computed` 的 `effect` 和 非 `computed` 的 `effect` 的执行顺序，通过明确的 `dirty` 来控制 `run` 和 `triggerRefValue` 的执行即可。
+
+### 06：总结：`computed` 计算属性
+
+到这里已经完成了 `computed` 计算书属性的构建。
+
+接下来总结一下计算属性实现的重点：
+
+1. 计算属性的实例，本质上是一个 `ComputedRefImpl` 的实例
+
+2. `ComputedRefImpl` 中通过 `dirty` 变量来控制 `run` 的执行和 `triggerRefValue` 的触发
+
+3. 想要访问计算属性的值，必须通过 `.value` ，因为它内部和 `ref` 一样是通过 `get value` 来进行实现的
+
+4. 每次 `.value` 时都会触发 `trackRefValue` 即：**收集依赖**
+
+5. 在触发依赖时，需要谨记，先触发 `computed` 的 `effect` ，再触发非 `computed` 的 `effect`
+
+   
+
+### 07：源码阅读：响应性的数据监听器 `watch`，跟踪源码实现逻辑
+
+`watch` 的实现和 `computed` 有一些相似的地方，但是作用却与 `computed` 大有不同。`watch` 可以 **监听响应式数据的变化，从而触发指定的函数**
+
+在 `vue3` 中使用 `watch` 的代码如下所示：
+
+![image-20230214023823399](img/image-20230214023823399.png)
+
+上述代码中 `watch` 函数接收三个参数：
+
+1. 监听的响应式对象
+2. 回调函数 cb
+3. 配置对象：`options`
+   1. `immediate`：`watch` 初始化完成后被立刻触发一次
+   2. `deep`：深度监听
+
+由此可见，`watch` 函数颇为复杂，所以我们在跟踪 `watch` 的源码实现时，应当分步骤进行跟踪。
+
+****
